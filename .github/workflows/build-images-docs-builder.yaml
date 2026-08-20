@@ -108,25 +108,35 @@ jobs:
         uses: ./.github/actions/set-env-variables
 
       # Warning: since this is a privileged workflow, subsequent workflow job
-      # steps must take care not to execute untrusted code.
+      # steps must take care not to execute untrusted code. The pull request
+      # is checked out into a subdirectory so that the trusted checkout (and
+      # in particular its scripts) cannot be overwritten by the pull request.
       - name: Checkout pull request branch (NOT TRUSTED)
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           persist-credentials: false
           ref: ${{ github.event.pull_request.head.sha }}
+          path: pr
 
       - name: Set up git
+        working-directory: pr
         run: |
           git config user.name "Cilium Imagebot"
           git config user.email "noreply@cilium.io"
+          # Never let repository configuration from the pull request drive
+          # what the git invocations of this privileged job execute.
+          git config core.hooksPath /dev/null
+          git config core.pager cat
 
       - name: Update docs-builder image reference in CI workflow
+        working-directory: pr
+        env:
+          NEW_IMAGE: quay.io/${{ env.QUAY_ORGANIZATION_DEV }}/docs-builder:${{ needs.build-and-push.outputs.tag }}@${{ needs.build-and-push.outputs.digest }}
         run: |
-          NEW_IMAGE="quay.io/${{ env.QUAY_ORGANIZATION_DEV }}/docs-builder:${{ needs.build-and-push.outputs.tag }}@${{ needs.build-and-push.outputs.digest }}"
-          # Run in Docker to prevent the script from accessing the environment.
-          docker run --rm -v $PWD:/cilium -w /cilium "${NEW_IMAGE}" \
-              bash -c "git config --global --add safe.directory /cilium && \
-                       /cilium/Documentation/update-docs-builder-image.sh ${NEW_IMAGE}"
+          # Use the script from the trusted checkout of the default branch:
+          # neither the script nor the image built from the pull request may
+          # be executed in this privileged job.
+          "${GITHUB_WORKSPACE}/Documentation/update-docs-builder-image.sh" "${NEW_IMAGE}"
           git commit -sam "ci: update docs-builder"
 
       - name: Get token
@@ -137,6 +147,7 @@ jobs:
           APP_ID: ${{ secrets.AUTO_COMMITTER_APP_ID }}
 
       - name: Push changes into PR
+        working-directory: pr
         env:
           REF: ${{ github.event.pull_request.head.ref }}
         run: |
