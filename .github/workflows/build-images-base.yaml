@@ -71,6 +71,7 @@ jobs:
           cp ./images/builder/update-cilium-builder-image.sh ../cilium-base-branch/images/builder/
           mkdir -p ../cilium-base-branch/images/scripts/
           cp ./images/scripts/get-image-digest.sh ../cilium-base-branch/images/scripts/
+          cp ./images/scripts/regenerate-protobuf-apis.sh ../cilium-base-branch/images/scripts/
           mkdir -p ../cilium-base-branch/api/v1
           cp ./api/v1/Makefile ../cilium-base-branch/api/v1/
           cp ./Makefile.defs ../cilium-base-branch/Makefile.defs
@@ -304,8 +305,11 @@ jobs:
         env:
           CONTAINER_IMAGE: quay.io/${{ env.QUAY_ORGANIZATION_DEV }}/cilium-builder:${{ steps.builder-tag.outputs.tag }}@${{ steps.docker_build_release_builder.outputs.digest }}
         run: |
-          export VOLUME=$PWD/api/v1
-          make -C ../cilium-base-branch/api/v1
+          # The builder image is built from the pull request, so it must never
+          # be given a bind mount source that the pull request controls: the
+          # trusted script below validates the path and only exposes a scratch
+          # copy of the API sources to the container.
+          ../cilium-base-branch/images/scripts/regenerate-protobuf-apis.sh "$PWD/api/v1"
 
       - name: Commit changes
         id: update-builder-image

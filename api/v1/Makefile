@@ -10,5 +10,8 @@ proto:
 	$(QUIET)$(CONTAINER_ENGINE) container run --rm \
 		--volume $(VOLUME):/src \
 		--user "$(shell id -u):$(shell id -g)" \
+		--network none \
+		--cap-drop all \
+		--security-opt no-new-privileges \
 		$(CONTAINER_IMAGE) \
 		make -C /src -f Makefile.protoc
