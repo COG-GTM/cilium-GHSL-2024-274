@@ -337,12 +337,22 @@ jobs:
 
       - name: Push changes into PR
         if: ${{ steps.update-runtime-image.outputs.committed == 'true' || steps.update-builder-image.outputs.committed == 'true' }}
+        shell: bash
         env:
           ref: ${{ github.event.pull_request.head.ref || github.ref }}
           repository:  ${{ github.event.pull_request.head.repo.full_name || github.repository }}
+          app_token: ${{ steps.get_token.outputs.app_token }}
         run: |
+          if [[ ! "${ref}" =~ ^[A-Za-z0-9._/-]+$ ]]; then
+            echo "Refusing to push: unexpected characters in branch name" >&2
+            exit 1
+          fi
+          if [[ ! "${repository}" =~ ^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$ ]]; then
+            echo "Refusing to push: unexpected characters in repository name" >&2
+            exit 1
+          fi
           git diff HEAD^
-          git push https://x-access-token:${{ steps.get_token.outputs.app_token }}@github.com/${{ env.repository }}.git HEAD:${{ env.ref }}
+          git push "https://x-access-token:${app_token}@github.com/${repository}.git" "HEAD:${ref}"
 
   image-digests:
     name: Display Digests
