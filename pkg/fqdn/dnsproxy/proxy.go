@@ -11,6 +11,7 @@ import (
 	"net"
 	"net/netip"
 	"regexp"
+	"runtime/debug"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -913,12 +914,47 @@ func setSoMarks(fd int, ipFamily ipfamily.IPFamily, secId identity.NumericIdenti
 //     fqdn/NameManager instance).
 //   - Write the response to the endpoint.
 func (p *DNSProxy) ServeDNS(w dns.ResponseWriter, request *dns.Msg) {
+	// The DNS server runs handlers in their own goroutine without recovering
+	// from panics, so an unhandled panic here would terminate the agent.
+	defer func() {
+		if r := recover(); r != nil {
+			log.WithFields(logrus.Fields{
+				logfields.IPAddr: w.RemoteAddr().String(),
+			}).Errorf("Panic while handling DNS request: %v\n%s", r, debug.Stack())
+		}
+	}()
+
+	p.serveDNS(w, request)
+}
+
+func (p *DNSProxy) serveDNS(w dns.ResponseWriter, request *dns.Msg) {
 	stat := ProxyRequestContext{DataSource: accesslog.DNSSourceProxy}
 	stat.TotalTime.Start()
 	requestID := request.Id // save the original request ID
-	qname := string(request.Question[0].Name)
 	protocol := w.LocalAddr().Network()
 	epIPPort := w.RemoteAddr().String()
+
+	// A message may be accepted by the DNS server with an empty question
+	// section even though its header advertises questions, for example when
+	// the datagram only contains a header. Handling such a request must not
+	// panic, as that would take down the whole agent.
+	if len(request.Question) == 0 {
+		scopedLog := log.WithFields(logrus.Fields{
+			logfields.IPAddr:       epIPPort,
+			logfields.DNSRequestID: requestID,
+		})
+		if p.logLimiter.Allow() {
+			scopedLog.Error("Dropping DNS request without question section")
+		}
+		stat.Err = fmt.Errorf("Invalid DNS request: no question section")
+		stat.ProcessingTime.Start()
+		stat.ProcessingTime.End(false)
+		p.NotifyOnDNSMsg(time.Now(), nil, epIPPort, 0, "", request, protocol, false, &stat)
+		p.sendRefused(scopedLog, w, request)
+		return
+	}
+
+	qname := string(request.Question[0].Name)
 	scopedLog := log.WithFields(logrus.Fields{
 		logfields.DNSName:      qname,
 		logfields.IPAddr:       epIPPort,
