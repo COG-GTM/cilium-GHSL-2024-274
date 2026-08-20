@@ -6,8 +6,10 @@ package dnsproxy
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net"
 	"net/netip"
 	"os"
@@ -383,6 +385,40 @@ func TestRejectNonMatchingRefusedResponseWithRefused(t *testing.T) {
 	// reject a query with Refused
 	s.proxy.SetRejectReply(option.FQDNProxyDenyWithRefused)
 	response, _, err := s.dnsTCPClient.Exchange(request, s.proxy.DNSServers[0].Listener.Addr().String())
+	require.NoError(t, err, "DNS request from test client failed when it should succeed")
+	require.Equal(t, dns.RcodeRefused, response.Rcode, "DNS request from test client was not rejected when it should be blocked")
+}
+
+func TestRejectQueryWithoutQuestion(t *testing.T) {
+	s := setupDNSProxyTestSuite(t)
+
+	// Header-only DNS query advertising one question, but carrying no
+	// question section. It is accepted by the server and handed to the
+	// handler with an empty question slice.
+	header := []byte{0xba, 0xbe, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}
+
+	conn, err := net.Dial("tcp", s.proxy.DNSServers[0].Listener.Addr().String())
+	require.NoError(t, err, "Could not connect to the DNS proxy")
+	defer conn.Close()
+	require.NoError(t, conn.SetDeadline(time.Now().Add(10*time.Second)))
+
+	_, err = conn.Write(append([]byte{0x00, byte(len(header))}, header...))
+	require.NoError(t, err, "Could not send malformed DNS request")
+
+	length := make([]byte, 2)
+	_, err = io.ReadFull(conn, length)
+	require.NoError(t, err, "No response to a DNS request without question section")
+	reply := make([]byte, binary.BigEndian.Uint16(length))
+	_, err = io.ReadFull(conn, reply)
+	require.NoError(t, err, "Truncated response to a DNS request without question section")
+
+	response := new(dns.Msg)
+	require.NoError(t, response.Unpack(reply), "Could not parse the proxy response")
+	require.Equal(t, dns.RcodeRefused, response.Rcode, "DNS request without question section was not refused")
+
+	// The proxy is still alive and serving requests.
+	request := s.requestRejectNonMatchingRefusedResponse(t)
+	response, _, err = s.dnsTCPClient.Exchange(request, s.proxy.DNSServers[0].Listener.Addr().String())
 	require.NoError(t, err, "DNS request from test client failed when it should succeed")
 	require.Equal(t, dns.RcodeRefused, response.Rcode, "DNS request from test client was not rejected when it should be blocked")
 }
