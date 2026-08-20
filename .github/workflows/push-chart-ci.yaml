@@ -56,25 +56,40 @@ jobs:
 
     - name: Get triggering event ref
       id: get-ref
+      env:
+        EVENT_NAME: ${{ github.event_name }}
+        CHECKOUT_REF: ${{ inputs.checkout_ref }}
+        HEAD_REPOSITORY_FORK: ${{ github.event.workflow_run.head_repository.fork }}
+        HEAD_BRANCH: ${{ github.event.workflow_run.head_branch }}
+        HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+        PUSH_REF: ${{ github.ref }}
+        PUSH_SHA: ${{ github.sha }}
       run: |
-        if [[ "${{ github.event_name }}" == "workflow_dispatch"  ]]; then
-          echo ref="${{ inputs.checkout_ref }}" >> $GITHUB_OUTPUT
-          echo sha="${{ inputs.checkout_ref }}" >> $GITHUB_OUTPUT
-        elif [[ "${{ github.event_name }}" == "workflow_run" ]]; then
-          if [[ "${{ github.event.workflow_run.head_repository.fork }}" == "true"  ]]; then
+        if [[ "${EVENT_NAME}" == "workflow_dispatch"  ]]; then
+          ref="${CHECKOUT_REF}"
+          sha="${CHECKOUT_REF}"
+        elif [[ "${EVENT_NAME}" == "workflow_run" ]]; then
+          if [[ "${HEAD_REPOSITORY_FORK}" == "true"  ]]; then
             # use the SHA on forks since the head_branch won't exist in the upstream repository
-            echo ref="${{ github.event.workflow_run.head_sha }}" >> $GITHUB_OUTPUT
+            ref="${HEAD_SHA}"
           else
-            echo ref="${{ github.event.workflow_run.head_branch }}" >> $GITHUB_OUTPUT
+            ref="${HEAD_BRANCH}"
           fi
-          echo sha="${{ github.event.workflow_run.head_sha }}" >> $GITHUB_OUTPUT
-        elif [[ "${{ github.event_name }}" == "push" ]]; then
-          echo ref="${{ github.ref }}" >> $GITHUB_OUTPUT
-          echo sha="${{ github.sha }}" >> $GITHUB_OUTPUT
+          sha="${HEAD_SHA}"
+        elif [[ "${EVENT_NAME}" == "push" ]]; then
+          ref="${PUSH_REF}"
+          sha="${PUSH_SHA}"
         else
           echo "Invalid event type"
           exit 1
         fi
+        # refuse values that could break the GITHUB_OUTPUT key=value format
+        if [[ "${ref}" == *$'\n'* || "${sha}" == *$'\n'* ]]; then
+          echo "Invalid ref or sha"
+          exit 1
+        fi
+        echo "ref=${ref}" >> $GITHUB_OUTPUT
+        echo "sha=${sha}" >> $GITHUB_OUTPUT
 
     - name: Set commit status to pending
       uses: myrotvorets/set-commit-status-action@3730c0a348a2ace3c110851bed53331bc6406e9f # v2.0.1
