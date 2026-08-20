@@ -21,14 +21,9 @@ on:
   #     - ft/v1.16/<your_branch>
 
 # By specifying the access of one of the scopes, all of those that are not
-# specified are set to 'none'.
-permissions:
-  # To be able to access the repository with actions/checkout
-  contents: read
-  # To allow retrieving information from the PR API
-  pull-requests: read
-  # To be able to set commit status
-  statuses: write
+# specified are set to 'none'. Permissions are granted per job so that the job
+# which handles untrusted (fork) code holds no permissions at all.
+permissions: {}
 
 concurrency:
   group: |
@@ -39,56 +34,74 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  push-charts:
-    name: Push Charts
+  # Resolves the ref/SHA that triggered this workflow. Runs before any
+  # untrusted code is present on disk and without any permissions or secrets.
+  resolve-ref:
+    name: Resolve Ref
     runs-on: ubuntu-24.04
     # we also check for push events in case someone is testing the workflow by uncommenting the push trigger above.
     if: ${{ github.event.workflow_run.conclusion == 'success' || github.event_name == 'workflow_dispatch' || github.event_name == 'push' }}
+    permissions: {}
+    outputs:
+      ref: ${{ steps.get-ref.outputs.ref }}
+      sha: ${{ steps.get-ref.outputs.sha }}
     steps:
-    - name: Checkout GitHub main
-      uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
-      with:
-        ref: ${{ github.event.repository.default_branch }}
-        persist-credentials: false
-
-    - name: Set Environment Variables
-      uses: ./.github/actions/set-env-variables
-
     - name: Get triggering event ref
       id: get-ref
+      env:
+        EVENT_NAME: ${{ github.event_name }}
+        DISPATCH_REF: ${{ inputs.checkout_ref }}
+        IS_FORK: ${{ github.event.workflow_run.head_repository.fork }}
+        RUN_HEAD_BRANCH: ${{ github.event.workflow_run.head_branch }}
+        RUN_HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+        PUSH_REF: ${{ github.ref }}
+        PUSH_SHA: ${{ github.sha }}
       run: |
-        if [[ "${{ github.event_name }}" == "workflow_dispatch"  ]]; then
-          echo ref="${{ inputs.checkout_ref }}" >> $GITHUB_OUTPUT
-          echo sha="${{ inputs.checkout_ref }}" >> $GITHUB_OUTPUT
-        elif [[ "${{ github.event_name }}" == "workflow_run" ]]; then
-          if [[ "${{ github.event.workflow_run.head_repository.fork }}" == "true"  ]]; then
+        set -o pipefail
+        set -e
+        if [[ "${EVENT_NAME}" == "workflow_dispatch" ]]; then
+          ref="${DISPATCH_REF}"
+          sha="${DISPATCH_REF}"
+        elif [[ "${EVENT_NAME}" == "workflow_run" ]]; then
+          if [[ "${IS_FORK}" == "true" ]]; then
             # use the SHA on forks since the head_branch won't exist in the upstream repository
-            echo ref="${{ github.event.workflow_run.head_sha }}" >> $GITHUB_OUTPUT
+            ref="${RUN_HEAD_SHA}"
           else
-            echo ref="${{ github.event.workflow_run.head_branch }}" >> $GITHUB_OUTPUT
+            ref="${RUN_HEAD_BRANCH}"
           fi
-          echo sha="${{ github.event.workflow_run.head_sha }}" >> $GITHUB_OUTPUT
-        elif [[ "${{ github.event_name }}" == "push" ]]; then
-          echo ref="${{ github.ref }}" >> $GITHUB_OUTPUT
-          echo sha="${{ github.sha }}" >> $GITHUB_OUTPUT
+          sha="${RUN_HEAD_SHA}"
+        elif [[ "${EVENT_NAME}" == "push" ]]; then
+          ref="${PUSH_REF}"
+          sha="${PUSH_SHA}"
         else
           echo "Invalid event type"
           exit 1
         fi
+        if [[ ! "${sha}" =~ ^[0-9a-f]{40}$ ]]; then
+          echo "Refusing to continue: '${sha}' is not a full commit SHA"
+          exit 1
+        fi
+        echo "ref=${ref}" >> $GITHUB_OUTPUT
+        echo "sha=${sha}" >> $GITHUB_OUTPUT
 
-    - name: Set commit status to pending
-      uses: myrotvorets/set-commit-status-action@3730c0a348a2ace3c110851bed53331bc6406e9f # v2.0.1
-      with:
-        sha: ${{ steps.get-ref.outputs.sha }}
-        status: pending
-        description: Helm push in progress
-
+  # This job checks out and runs code from the triggering ref, which is
+  # untrusted when the run originates from a fork. It therefore holds no
+  # secrets and no token permissions, and its only output (the chart version)
+  # is treated as untrusted data and validated by the privileged job below.
+  compute-version:
+    name: Compute Chart Version
+    runs-on: ubuntu-24.04
+    needs: resolve-ref
+    permissions: {}
+    outputs:
+      chart_version: ${{ steps.get-version.outputs.chart_version }}
+    steps:
     - name: Checkout Source Code
       uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       with:
         persist-credentials: false
         # checkout ref not SHA so we can get useful branch names (see previous comments)
-        ref: ${{ steps.get-ref.outputs.ref }}
+        ref: ${{ needs.resolve-ref.outputs.ref }}
         # required for git describe
         fetch-depth: 0
     - name: Get version
@@ -103,21 +116,82 @@ jobs:
           exit 1
         fi
 
+  push-charts:
+    name: Push Charts
+    runs-on: ubuntu-24.04
+    needs:
+    - resolve-ref
+    - compute-version
+    # This job holds the chart registry credentials. Configure this environment
+    # with required reviewers to gate pushes if additional protection is needed.
+    environment: chart-ci-push
+    permissions:
+      # To be able to set commit status
+      statuses: write
+    steps:
+    # The workspace only ever contains the trusted default branch. Nothing from
+    # the triggering (potentially fork-owned) ref is executed in this job.
+    - name: Checkout GitHub main
+      uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      with:
+        ref: ${{ github.event.repository.default_branch }}
+        persist-credentials: false
+
+    - name: Set Environment Variables
+      uses: ./.github/actions/set-env-variables
+
+    - name: Set commit status to pending
+      uses: myrotvorets/set-commit-status-action@3730c0a348a2ace3c110851bed53331bc6406e9f # v2.0.1
+      with:
+        sha: ${{ needs.resolve-ref.outputs.sha }}
+        status: pending
+        description: Helm push in progress
+
+    - name: Validate chart version
+      id: get-version
+      env:
+        # untrusted: produced by a script from the triggering ref
+        CHART_VERSION: ${{ needs.compute-version.outputs.chart_version }}
+        SHA: ${{ needs.resolve-ref.outputs.sha }}
+      run: |
+        set -o pipefail
+        set -e
+        short_sha="${SHA:0:7}"
+        # The version must be a dev chart version derived from the triggering
+        # commit, so that a crafted version cannot overwrite unrelated tags.
+        if [[ ! "${CHART_VERSION}" =~ ^[0-9]+\.[0-9]+\.[0-9]+[0-9A-Za-z.-]*-dev\.[0-9]+-[0-9A-Za-z.-]*-${short_sha}[0-9a-f]*$ ]]; then
+          echo "Refusing to push: unexpected chart version '${CHART_VERSION}'"
+          exit 1
+        fi
+        echo "chart_version=${CHART_VERSION}" | tee -a $GITHUB_OUTPUT
+
+    # Data-only checkout of the chart directory from the triggering ref. It is
+    # placed in a separate directory so it cannot replace the trusted workspace,
+    # and by SHA so the fetched content matches the commit that was built.
+    - name: Checkout chart directory
+      uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      with:
+        persist-credentials: false
+        ref: ${{ needs.resolve-ref.outputs.sha }}
+        path: untrusted-chart
+        sparse-checkout: install/kubernetes/cilium
+        sparse-checkout-cone-mode: false
+
     - name: Push charts
       uses: cilium/reusable-workflows/.github/actions/push-helm-chart@6ae27958f2f37545bf48e44106b73df05b1f6d12 # v0.1.0
       with:
         name: cilium
-        path: install/kubernetes/cilium
+        path: untrusted-chart/install/kubernetes/cilium
         version: ${{ steps.get-version.outputs.chart_version }}
         values_file_changes: |
           {
 
             "image.repository": "quay.io/${{ env.QUAY_ORGANIZATION_DEV }}/cilium-ci",
-            "image.tag": "${{ steps.get-ref.outputs.sha }}",
+            "image.tag": "${{ needs.resolve-ref.outputs.sha }}",
             "image.digest": "",
             "image.useDigest": false,
             "preflight.image.repository": "quay.io/${{ env.QUAY_ORGANIZATION_DEV }}/cilium-ci",
-            "preflight.image.tag": "${{ steps.get-ref.outputs.sha }}",
+            "preflight.image.tag": "${{ needs.resolve-ref.outputs.sha }}",
             "preflight.image.digest": "",
             "preflight.image.useDigest": false,
             "operator.image.repository": "quay.io/${{ env.QUAY_ORGANIZATION_DEV }}/operator",
@@ -127,13 +201,13 @@ jobs:
             "operator.image.awsDigest": "",
             "operator.image.alibabacloudDigest": "",
             "operator.image.useDigest": false,
-            "operator.image.tag": "${{ steps.get-ref.outputs.sha }}",
+            "operator.image.tag": "${{ needs.resolve-ref.outputs.sha }}",
             "hubble.relay.image.repository": "quay.io/${{ env.QUAY_ORGANIZATION_DEV }}/hubble-relay-ci",
-            "hubble.relay.image.tag": "${{ steps.get-ref.outputs.sha }}",
+            "hubble.relay.image.tag": "${{ needs.resolve-ref.outputs.sha }}",
             "hubble.relay.image.digest": "",
             "hubble.relay.image.useDigest": false,
             "clustermesh.apiserver.image.repository": "quay.io/${{ env.QUAY_ORGANIZATION_DEV }}/clustermesh-apiserver-ci",
-            "clustermesh.apiserver.image.tag": "${{ steps.get-ref.outputs.sha }}",
+            "clustermesh.apiserver.image.tag": "${{ needs.resolve-ref.outputs.sha }}",
             "clustermesh.apiserver.image.digest": "",
             "clustermesh.apiserver.image.useDigest": false
           }
@@ -152,7 +226,7 @@ jobs:
       if: ${{ success() }}
       uses: myrotvorets/set-commit-status-action@3730c0a348a2ace3c110851bed53331bc6406e9f # v2.0.1
       with:
-        sha: ${{ steps.get-ref.outputs.sha }}
+        sha: ${{ needs.resolve-ref.outputs.sha }}
         status: success
         description: Helm push successful
 
@@ -160,7 +234,7 @@ jobs:
       if: ${{ failure() }}
       uses: myrotvorets/set-commit-status-action@3730c0a348a2ace3c110851bed53331bc6406e9f # v2.0.1
       with:
-        sha: ${{ steps.get-ref.outputs.sha }}
+        sha: ${{ needs.resolve-ref.outputs.sha }}
         status: failure
         description: Helm push failed
 
@@ -168,6 +242,6 @@ jobs:
       if: ${{ cancelled() }}
       uses: myrotvorets/set-commit-status-action@3730c0a348a2ace3c110851bed53331bc6406e9f # v2.0.1
       with:
-        sha: ${{ steps.get-ref.outputs.sha }}
+        sha: ${{ needs.resolve-ref.outputs.sha }}
         status: error
         description: Helm push cancelled
