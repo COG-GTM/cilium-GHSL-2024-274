@@ -25,25 +25,41 @@
         env:
           body: ${{ inputs.pr-body }}
         steps:
-          - name: Pre-process PR body
+          # The PR body is attacker-influenced, so it is never interpolated into a
+          # shell command. It is parsed in JavaScript and only the extracted PR
+          # numbers are handed to the next step, through the environment.
+          - name: Extract the backported PR numbers
             id: pre-process
             uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea # v7.0.1
             with:
               script: |
                 const { body } = process.env
-                return body.replace(/\'/g, '')
-                  .replace(/"/g, '')
-                  .replace(/`/g, '')
-                  .replace(/$/g, '')
+                const lines = body.split(/\r?\n/)
+                const prs = []
+                for (let i = 0; i < lines.length - 1; i++) {
+                  if (!lines[i].includes('upstream-prs')) {
+                    continue
+                  }
+                  const numbers = lines[i + 1].split(';')[0].match(/[0-9]+/g)
+                  if (numbers !== null) {
+                    prs.push(...numbers)
+                  }
+                }
+                return prs.join('\n')
               result-encoding: string
 
           - name: Update labels
             env:
               GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+              PRS: ${{ steps.pre-process.outputs.result }}
+              BRANCH: ${{ inputs.branch }}
             run: |
-              echo "${{steps.pre-process.outputs.result}}" | sed -En "/upstream-prs/ { n; p }" | cut -d ';' -f 1 | grep -Eo '[0-9]+' | while read -r pr; do
-                echo "Removing label backport-pending/${{ inputs.branch }} from pr #${pr}."
-                gh pr edit ${pr} --repo "${GITHUB_REPOSITORY}" --remove-label backport-pending/${{ inputs.branch }}
-                echo "Adding label backport-done/${{ inputs.branch }} to pr #${pr}."
-                gh pr edit ${pr} --repo "${GITHUB_REPOSITORY}" --add-label backport-done/${{ inputs.branch }}
+              echo "${PRS}" | while read -r pr; do
+                if [ -z "${pr}" ]; then
+                  continue
+                fi
+                echo "Removing label backport-pending/${BRANCH} from pr #${pr}."
+                gh pr edit "${pr}" --repo "${GITHUB_REPOSITORY}" --remove-label "backport-pending/${BRANCH}"
+                echo "Adding label backport-done/${BRANCH} to pr #${pr}."
+                gh pr edit "${pr}" --repo "${GITHUB_REPOSITORY}" --add-label "backport-done/${BRANCH}"
               done
